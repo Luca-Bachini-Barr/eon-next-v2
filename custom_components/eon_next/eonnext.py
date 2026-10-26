@@ -10,10 +10,17 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
-from .const import API_BASE_URL, AUTH0_CLIENT_ID, AUTH0_TOKEN_URL
+from .const import (
+    API_BASE_URL,
+    AUTH0_CLIENT_ID,
+    AUTH0_TOKEN_URL,
+    GAS_CALORIC_VALUE,
+    GAS_VOLUME_CORRECTION,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -134,6 +141,55 @@ def _jwt_expiry(token: str) -> int | None:
     except (IndexError, ValueError, AttributeError):
         return None
     return int(exp) if isinstance(exp, int | float) else None
+
+
+# GraphQL consumption (replaces the REST endpoint, which rejects Auth0 tokens).
+# POINTS_FIELD is swapped for electricityMeterPoints / gasMeterPoints.
+_METER_CONSUMPTION_QUERY = """
+query getMeterConsumption($accountNumber: String!, $startAt: DateTime!, $grouping: ConsumptionGroupings!, $timezone: String!, $first: Int!, $after: String) {
+  properties(accountNumber: $accountNumber) {
+    POINTS_FIELD {
+      meters(includeInactive: false) {
+        serialNumber
+        consumptionUnits
+        consumption(startAt: $startAt, grouping: $grouping, timezone: $timezone, first: $first, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            node {
+              value
+              startAt
+              endAt
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+_CONSUMPTION_GROUPINGS = {"half_hour": "HALF_HOUR", "hour": "HOUR", "day": "DAY"}
+_CONSUMPTION_SLOT = {
+    "HALF_HOUR": datetime.timedelta(minutes=30),
+    "HOUR": datetime.timedelta(hours=1),
+}
+_CONSUMPTION_TIMEZONE = "Europe/London"
+_CONSUMPTION_PAGE_SIZE = 100
+
+
+def _parse_iso_datetime(value: Any) -> datetime.datetime | None:
+    """Parse an ISO datetime (``Z`` allowed) to an aware datetime, or ``None``."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
 
 
 def _iso_date(value: Any) -> datetime.date | None:
@@ -517,58 +573,144 @@ class EonNext:
         period_from: str | None = None,
         period_to: str | None = None,
     ) -> dict | None:
-        """Fetch consumption data from the REST API endpoint."""
-        if not supply_point_id:
-            return None
+        """Fetch consumption data for one meter.
 
+        The REST consumption endpoint rejects the Auth0 ID token, so this reads
+        the GraphQL ``consumption`` connection instead and returns it in the
+        REST shape callers expect: ``{"results": [{"consumption",
+        "interval_start", "interval_end"}, ...]}``, newest first, in kWh.
+        Without ``period_from`` the latest ``page_size`` buckets are returned.
+        """
+        grouping = _CONSUMPTION_GROUPINGS.get(group_by)
+        if not supply_point_id or grouping is None:
+            return None
         if meter_type == METER_TYPE_ELECTRIC:
-            url = f"{API_BASE_URL}/electricity-meter-points/{supply_point_id}/meters/{serial}/consumption/"
+            points_field = "electricityMeterPoints"
         elif meter_type == METER_TYPE_GAS:
-            url = f"{API_BASE_URL}/gas-meter-points/{supply_point_id}/meters/{serial}/consumption/"
+            points_field = "gasMeterPoints"
         else:
             return None
 
-        params: dict[str, str] = {"group_by": group_by, "page_size": str(page_size)}
-        if period_from:
-            params["period_from"] = period_from
-        if period_to:
-            params["period_to"] = period_to
+        account_number = next(
+            (
+                account.account_number
+                for account in self.accounts
+                for meter in account.meters
+                if meter.serial == serial
+            ),
+            None,
+        )
+        if account_number is None:
+            return None
 
-        # One transparent refresh-and-retry on a 401/403 before escalating.
-        attempted_refresh = False
-        while True:
-            token = await self.__auth_token()
-            headers = {"Authorization": token}
+        tz = ZoneInfo(_CONSUMPTION_TIMEZONE)
+        period_start = _parse_iso_datetime(period_from)
+        if period_start is not None:
+            start_at = period_start
+        elif grouping == "DAY":
+            today = datetime.datetime.now(tz).date()
+            start_at = datetime.datetime.combine(
+                today - datetime.timedelta(days=page_size - 1),
+                datetime.time.min,
+                tzinfo=tz,
+            )
+        else:
+            slot = _CONSUMPTION_SLOT[grouping]
+            now = datetime.datetime.now(datetime.timezone.utc)
+            start_at = now - slot * page_size
+            start_at -= datetime.timedelta(
+                minutes=start_at.minute % int(slot.total_seconds() // 60),
+                seconds=start_at.second,
+                microseconds=start_at.microsecond,
+            )
+        end_at = _parse_iso_datetime(period_to)
 
-            session = await self._get_session()
+        query = _METER_CONSUMPTION_QUERY.replace("POINTS_FIELD", points_field)
+        nodes: list[dict[str, Any]] = []
+        units: str | None = None
+        after: str | None = None
+        # Cap pages so a misbehaving cursor can never loop forever.
+        for _page in range(20):
+            result = await self._graphql_post(
+                "getMeterConsumption",
+                query,
+                {
+                    "accountNumber": account_number,
+                    "startAt": start_at.isoformat(),
+                    "grouping": grouping,
+                    "timezone": _CONSUMPTION_TIMEZONE,
+                    "first": _CONSUMPTION_PAGE_SIZE,
+                    "after": after,
+                },
+            )
+            if not self._json_contains_key_chain(result, ["data", "properties"]):
+                raise EonNextApiError(f"Unable to load consumption for meter {serial}")
+
+            connection = None
+            for prop in result["data"]["properties"] or []:
+                for point in (prop or {}).get(points_field) or []:
+                    for meter in (point or {}).get("meters") or []:
+                        if meter and meter.get("serialNumber") == serial:
+                            connection = meter.get("consumption") or {}
+                            units = meter.get("consumptionUnits") or units
+            if connection is None:
+                return None
+
+            nodes.extend(
+                edge["node"]
+                for edge in connection.get("edges") or []
+                if edge and edge.get("node")
+            )
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage") or not page_info.get("endCursor"):
+                break
+            if period_start is None and len(nodes) >= page_size:
+                break
+            last_start = _parse_iso_datetime(nodes[-1].get("startAt")) if nodes else None
+            if end_at is not None and last_start is not None and last_start >= end_at:
+                break
+            after = page_info["endCursor"]
+
+        # Gas meters can report volume; the integration treats consumption as kWh.
+        unit_text = (units or "").lower()
+        is_volume = (
+            meter_type == METER_TYPE_GAS
+            and "m" in unit_text
+            and "kwh" not in unit_text
+        )
+
+        dated: list[tuple[datetime.datetime, dict[str, Any]]] = []
+        for node in nodes:
+            start = _parse_iso_datetime(node.get("startAt"))
+            if start is None:
+                continue
+            if end_at is not None and start >= end_at:
+                continue
+            value = node.get("value")
             try:
-                async with session.get(url, params=params, headers=headers) as response:
-                    if response.status in (401, 403):
-                        if not attempted_refresh:
-                            attempted_refresh = True
-                            if await self._force_token_refresh():
-                                continue
-                        raise EonNextAuthError("Authentication rejected by API")
+                consumption = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                consumption = None
+            if consumption is not None and is_volume:
+                consumption = (
+                    consumption * GAS_VOLUME_CORRECTION * GAS_CALORIC_VALUE / 3.6
+                )
+            dated.append(
+                (
+                    start,
+                    {
+                        "consumption": consumption,
+                        "interval_start": node.get("startAt"),
+                        "interval_end": node.get("endAt"),
+                    },
+                )
+            )
 
-                    if response.status == 200:
-                        data = await response.json()
-                        if "results" in data:
-                            return data
-                        # 200 with no results key: genuine "no data for this
-                        # period" - distinct from a transport error below.
-                        return None
-
-                    # Non-200 is a transport/server error, not "no data".  Raise
-                    # so callers (backfill, coordinator) can retry the same
-                    # period instead of silently advancing past a permanent hole.
-                    raise EonNextApiError(
-                        f"REST consumption endpoint returned status {response.status}"
-                    )
-            except aiohttp.ClientError as err:
-                _LOGGER.debug("REST consumption request failed for %s: %s", serial, err)
-                raise EonNextApiError(
-                    f"REST consumption request failed for {serial}: {err}"
-                ) from err
+        dated.sort(key=lambda item: item[0], reverse=True)
+        results = [entry for _start, entry in dated]
+        if period_start is None:
+            results = results[:page_size]
+        return {"results": results}
 
     async def async_get_smart_charging_schedule(
         self,
