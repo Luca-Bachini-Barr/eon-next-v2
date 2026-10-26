@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,7 +13,7 @@ from typing import Any
 
 import aiohttp
 
-from .const import API_BASE_URL
+from .const import API_BASE_URL, AUTH0_CLIENT_ID, AUTH0_TOKEN_URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -118,6 +120,21 @@ query getAccountAgreements($accountNumber: String!) {
 # before it lapses (or being rejected under mild server clock skew).
 _TOKEN_EXPIRY_MARGIN_SECONDS = 60
 
+# Auth0 errors meaning the refresh token itself is dead - the user must paste
+# a new one.
+_AUTH0_FATAL_ERRORS = {"invalid_grant", "unauthorized_client", "access_denied"}
+
+
+def _jwt_expiry(token: str) -> int | None:
+    """Return a JWT's ``exp`` claim without verifying it, or ``None``."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except (IndexError, ValueError, AttributeError):
+        return None
+    return int(exp) if isinstance(exp, int | float) else None
+
 
 def _iso_date(value: Any) -> datetime.date | None:
     """Parse the calendar-date portion of an ISO date/datetime string."""
@@ -146,11 +163,18 @@ class SmartChargingDevice:
 
 
 class EonNext:
-    """API client for E.ON Next."""
+    """API client for E.ON Next.
+
+    E.ON Next moved customer login to Auth0 (with a CAPTCHA), and Kraken's
+    ``obtainKrakenToken`` no longer accepts an email/password.  The only
+    headless route left is the refresh token from a signed-in browser session:
+    it is exchanged at Auth0 for a short-lived ID token, which Kraken accepts
+    as the raw ``Authorization`` header.  Auth0 rotates refresh tokens on every
+    exchange, so each new one is handed to the token update callback to persist.
+    """
 
     def __init__(self):
         self.username = ""
-        self.password = ""
         self._session: aiohttp.ClientSession | None = None
         self._auth_lock = asyncio.Lock()
         self._on_token_update: Callable[[str], None] | None = None
@@ -202,36 +226,40 @@ class EonNext:
             "refresh": {"token": None, "expires": None},
         }
 
-    def __store_authentication(self, kraken_token: dict):
+    def __store_authentication(self, auth0_token: dict, refresh_token: str):
         # Validate the token shape up front: a missing/renamed field must
         # surface as an auth error (→ re-auth) rather than a raw
         # KeyError/TypeError escaping the login methods.
-        try:
-            payload = kraken_token["payload"]
-            issued_at = payload["iat"]
-            access_token = kraken_token["token"]
-            access_expires = payload["exp"]
-            refresh_token = kraken_token["refreshToken"]
-            refresh_expires_in = kraken_token["refreshExpiresIn"]
-        except (KeyError, TypeError) as err:
-            raise EonNextAuthError(
-                "Malformed authentication token payload"
-            ) from err
+        id_token = auth0_token.get("id_token")
+        if not isinstance(id_token, str) or not id_token:
+            raise EonNextAuthError("Malformed authentication token payload")
+        expires = _jwt_expiry(id_token)
+        if expires is None:
+            expires_in = auth0_token.get("expires_in")
+            if not isinstance(expires_in, int | float):
+                raise EonNextAuthError("Malformed authentication token payload")
+            expires = self.__current_timestamp() + int(expires_in)
+
+        # Auth0 rotates refresh tokens: the old one stops working once the
+        # new one is issued, so it must be persisted immediately.
+        new_refresh_token = auth0_token.get("refresh_token") or refresh_token
 
         self.auth = {
-            "issued": issued_at,
+            "issued": self.__current_timestamp(),
             "token": {
-                "token": access_token,
-                "expires": access_expires,
+                "token": id_token,
+                "expires": expires,
             },
+            # Auth0 does not report the refresh token's lifetime; it is
+            # treated as valid until Auth0 rejects it.
             "refresh": {
-                "token": refresh_token,
-                "expires": issued_at + refresh_expires_in,
+                "token": new_refresh_token,
+                "expires": None,
             },
         }
         if self._on_token_update is not None:
             try:
-                self._on_token_update(self.auth["refresh"]["token"])
+                self._on_token_update(new_refresh_token)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Error while running token update callback")
 
@@ -249,7 +277,9 @@ class EonNext:
         if self.auth["refresh"]["token"] is None:
             return False
         refresh_expires = self.auth["refresh"]["expires"]
-        if refresh_expires is None or not isinstance(refresh_expires, int | float):
+        if refresh_expires is None:
+            return True
+        if not isinstance(refresh_expires, int | float):
             return False
         if refresh_expires <= self.__current_timestamp():
             return False
@@ -260,12 +290,6 @@ class EonNext:
             if not self.__auth_token_is_valid():
                 if self.__refresh_token_is_valid():
                     await self.__login_with_refresh_token()
-                else:
-                    await self.login_with_username_and_password(
-                        self.username,
-                        self.password,
-                        initialise=False,
-                    )
 
             if not self.__auth_token_is_valid():
                 raise EonNextAuthError("Unable to authenticate")
@@ -287,12 +311,6 @@ class EonNext:
             self.auth["token"]["expires"] = None
             if self.__refresh_token_is_valid():
                 await self.__login_with_refresh_token()
-            else:
-                await self.login_with_username_and_password(
-                    self.username,
-                    self.password,
-                    initialise=False,
-                )
             return self.__auth_token_is_valid()
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -323,7 +341,7 @@ class EonNext:
         while True:
             headers: dict[str, str] = {}
             if authenticated:
-                headers["authorization"] = f"JWT {await self.__auth_token()}"
+                headers["authorization"] = await self.__auth_token()
 
             session = await self._get_session()
             try:
@@ -384,52 +402,25 @@ class EonNext:
                 _LOGGER.error("GraphQL request failed for %s: %s", operation, err)
                 raise EonNextApiError(f"API request failed: {err}") from err
 
-    async def login_with_username_and_password(
-        self,
-        username: str | None = None,
-        password: str | None = None,
-        initialise: bool = True,
-    ) -> bool:
-        if username is not None:
-            self.username = username
-        if password is not None:
-            self.password = password
-
+    async def _auth0_token_request(self, refresh_token: str) -> tuple[int, Any]:
+        """Exchange an Auth0 refresh token; returns ``(status, json body)``."""
+        session = await self._get_session()
         try:
-            result = await self._graphql_post(
-                "loginEmailAuthentication",
-                "mutation loginEmailAuthentication($input: ObtainJSONWebTokenInput!) {obtainKrakenToken(input: $input) {    payload    refreshExpiresIn    refreshToken    token    __typename}}",
-                {
-                    "input": {
-                        "email": self.username,
-                        "password": self.password,
-                    }
+            async with session.post(
+                AUTH0_TOKEN_URL,
+                json={
+                    "grant_type": "refresh_token",
+                    "client_id": AUTH0_CLIENT_ID,
+                    "refresh_token": refresh_token,
                 },
-                False,
-            )
-        except EonNextAuthError:
-            self.__reset_authentication()
-            return False
-        except EonNextApiError:
-            # API/transient error - don't destroy auth state.
-            raise
-
-        if self._json_contains_key_chain(result, ["data", "obtainKrakenToken", "token"]):
-            self.__store_authentication(result["data"]["obtainKrakenToken"])
-            if initialise:
-                await self.__init_accounts()
-            return True
-
-        errors = result.get("errors")
-        if isinstance(errors, list):
-            summary: Any = [
-                e.get("message", "error") for e in errors if isinstance(e, dict)
-            ] or "Unknown error"
-        else:
-            summary = "Unknown error"
-        _LOGGER.error("Authentication failed: %s", summary)
-        self.__reset_authentication()
-        return False
+            ) as response:
+                try:
+                    body = await response.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    body = None
+                return response.status, body
+        except aiohttp.ClientError as err:
+            raise EonNextApiError(f"Auth0 token request failed: {err}") from err
 
     async def login_with_refresh_token(self, token: str) -> bool:
         return await self.__login_with_refresh_token(True, token)
@@ -443,30 +434,26 @@ class EonNext:
         if refresh_token is None:
             return False
 
-        try:
-            result = await self._graphql_post(
-                "refreshToken",
-                "mutation refreshToken($input: ObtainJSONWebTokenInput!) {  obtainKrakenToken(input: $input) {    payload    refreshExpiresIn    refreshToken    token    __typename  }}",
-                {"input": {"refreshToken": refresh_token}},
-                False,
-            )
-        except EonNextAuthError:
-            self.__reset_authentication()
-            return False
-        except EonNextApiError as err:
-            # API/transient error - don't destroy the refresh token so it
-            # can be retried once the API recovers.
-            _LOGGER.debug("API error during token refresh, will retry later: %s", err)
-            raise
+        # Transport errors propagate as EonNextApiError without destroying the
+        # refresh token, so it can be retried once the API recovers.
+        status, body = await self._auth0_token_request(refresh_token)
+        error = body.get("error") if isinstance(body, dict) else None
 
-        if self._json_contains_key_chain(result, ["data", "obtainKrakenToken", "token"]):
-            self.__store_authentication(result["data"]["obtainKrakenToken"])
+        if status == 200 and isinstance(body, dict):
+            self.__store_authentication(body, refresh_token)
             if initialise:
                 await self.__init_accounts()
             return True
 
-        self.__reset_authentication()
-        return False
+        if error in _AUTH0_FATAL_ERRORS or status in (400, 401, 403):
+            _LOGGER.error(
+                "E.ON Next refresh token was rejected (%s); a new one is needed",
+                error or f"HTTP {status}",
+            )
+            self.__reset_authentication()
+            return False
+
+        raise EonNextApiError(f"Auth0 token refresh failed (HTTP {status})")
 
     def __reset_accounts(self):
         self.accounts: list[EnergyAccount] = []
@@ -551,7 +538,7 @@ class EonNext:
         attempted_refresh = False
         while True:
             token = await self.__auth_token()
-            headers = {"Authorization": f"JWT {token}"}
+            headers = {"Authorization": token}
 
             session = await self._get_session()
             try:
