@@ -17,7 +17,6 @@ from .backfill import EonNextBackfillManager
 from .const import (
     CARDS_URL,
     CONF_EMAIL,
-    CONF_PASSWORD,
     CONF_REFRESH_TOKEN,
     CONF_SHOW_CARD,
     CONF_SHOW_PANEL,
@@ -235,7 +234,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: EonNextConfigEntry) -> b
 
     api.set_token_update_callback(_persist_refresh_token)
     api.username = entry.data[CONF_EMAIL]
-    api.password = entry.data[CONF_PASSWORD]
 
     # All login, account/meter loading, and manager initialisation is wrapped
     # so that a failure is mapped to the correct HA outcome (re-auth vs retry)
@@ -243,24 +241,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: EonNextConfigEntry) -> b
     # or malformed payload escapes as a bare "Error" and leaks a session per
     # setup retry ("Unclosed client session").
     try:
-        # Try stored refresh token first to avoid a redundant password login.
+        # E.ON Next login is Auth0-only now, so the stored (rotating) refresh
+        # token is the sole credential; a missing or rejected one needs re-auth.
         stored_refresh_token = entry.data.get(CONF_REFRESH_TOKEN)
         if stored_refresh_token:
             authenticated = await api.login_with_refresh_token(stored_refresh_token)
-            if authenticated:
-                _LOGGER.debug("Authenticated using stored refresh token")
-            else:
-                _LOGGER.debug(
-                    "Stored refresh token expired, falling back to credentials"
-                )
-
-        # Fall back to username/password if refresh token was unavailable.
         if not authenticated:
-            authenticated = await api.login_with_username_and_password(
-                entry.data[CONF_EMAIL], entry.data[CONF_PASSWORD]
-            )
-            if not authenticated:
-                raise ConfigEntryAuthFailed("Failed to authenticate with Eon Next")
+            raise ConfigEntryAuthFailed("Failed to authenticate with Eon Next")
 
         coordinator = EonNextCoordinator(hass, api, DEFAULT_UPDATE_INTERVAL_MINUTES)
         backfill = EonNextBackfillManager(hass, entry, api, coordinator)

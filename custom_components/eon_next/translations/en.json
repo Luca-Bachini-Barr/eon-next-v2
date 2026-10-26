@@ -6,24 +6,23 @@
         },
         "error": {
             "cannot_connect": "Unable to connect to E.ON Next API",
-            "invalid_auth": "Authentication failed",
+            "invalid_auth": "Refresh token rejected - get a fresh one and try again",
             "unknown": "An unexpected error occurred"
         },
         "step": {
             "reauth_confirm": {
                 "data": {
-                    "email": "Email address",
-                    "password": "Password"
+                    "refresh_token": "Refresh token"
                 },
-                "description": "Your login is no longer valid. Re-enter your credentials to reconnect.",
+                "description": "The saved login for {email} is no longer valid. Log in at eonnext.com in a browser, open DevTools → Console and run: Object.keys(localStorage).filter(k=>k.startsWith('@@auth0spajs@@')).map(k=>JSON.parse(localStorage[k]).body?.refresh_token).find(Boolean) - paste the value without quotes, then close the tab WITHOUT logging out (logging out revokes the token).",
                 "title": "Reauthenticate Eon Next"
             },
             "user": {
                 "data": {
                     "email": "Email address",
-                    "password": "Password"
+                    "refresh_token": "Refresh token"
                 },
-                "description": "Login to your Eon Next account.",
+                "description": "E.ON Next now signs in through Auth0, so a password can't be used. Log in at eonnext.com in a browser, open DevTools → Console and run: Object.keys(localStorage).filter(k=>k.startsWith('@@auth0spajs@@')).map(k=>JSON.parse(localStorage[k]).body?.refresh_token).find(Boolean) - paste the value without quotes, then close the tab WITHOUT logging out (logging out revokes the token).",
                 "title": "Login"
             }
         }

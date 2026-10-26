@@ -1,12 +1,17 @@
 """Constants for the Eon Next integration."""
 
 DOMAIN = "eon_next"
-INTEGRATION_VERSION = "1.10.0"  # x-release-please-version
+INTEGRATION_VERSION = "1.10.0.1"  # x-release-please-version
 
 # Authentication
 CONF_EMAIL = "email"
-CONF_PASSWORD = "password"
+CONF_PASSWORD = "password"  # legacy; Kraken no longer accepts it
 CONF_REFRESH_TOKEN = "refresh_token"
+
+# E.ON Next login moved to Auth0.  This is the web dashboard's public SPA
+# client (served in eonnext.com's JS, no client secret).
+AUTH0_TOKEN_URL = "https://auth.eonnext.com/oauth/token"
+AUTH0_CLIENT_ID = "OrFeFacHUoXK2afczePYMLCRMXpwRxzW"
 
 # Frontend / dashboard
 CONF_SHOW_PANEL = "show_panel"

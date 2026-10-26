@@ -37,7 +37,7 @@ from .const import (
     DEFAULT_SHOW_PANEL,
     DOMAIN,
 )
-from .eonnext import EonNext, EonNextApiError
+from .eonnext import EonNext, EonNextApiError, EonNextAuthError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,23 +53,21 @@ class EonNextConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Return options flow for this handler."""
         return EonNextOptionsFlow()
 
-    async def _validate_credentials(self, email: str, password: str) -> str | None:
-        """Validate credentials against E.ON Next.
+    async def _validate_refresh_token(self, refresh_token: str) -> str | None:
+        """Validate an Auth0 refresh token against E.ON Next.
 
-        Returns the refresh token on success, or None on failure.
+        Auth0 rotates the token on use, so the *new* refresh token is returned
+        on success (the submitted one is dead by then), or None on failure.
         """
         api = EonNext()
         try:
-            success = await api.login_with_username_and_password(
-                email,
-                password,
-                initialise=False,
-            )
-            if success:
+            if await api.login_with_refresh_token(refresh_token.strip()):
                 return api.auth["refresh"]["token"]
             return None
+        except EonNextAuthError:
+            return None
         except EonNextApiError as err:
-            _LOGGER.debug("API/connection error during credential validation: %s", err)
+            _LOGGER.debug("API/connection error during token validation: %s", err)
             raise
         except Exception:  # pylint: disable=broad-except
             _LOGGER.exception("Unexpected error during authentication")
@@ -83,13 +81,14 @@ class EonNextConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             email = user_input[CONF_EMAIL].strip().lower()
-            password = user_input[CONF_PASSWORD]
 
             await self.async_set_unique_id(email)
             self._abort_if_unique_id_configured()
 
             try:
-                refresh_token = await self._validate_credentials(email, password)
+                refresh_token = await self._validate_refresh_token(
+                    user_input[CONF_REFRESH_TOKEN]
+                )
             except EonNextApiError:
                 errors["base"] = "cannot_connect"
             except Exception:  # pylint: disable=broad-except
@@ -100,7 +99,6 @@ class EonNextConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         title="Eon Next",
                         data={
                             CONF_EMAIL: email,
-                            CONF_PASSWORD: password,
                             CONF_REFRESH_TOKEN: refresh_token,
                         },
                     )
@@ -111,7 +109,7 @@ class EonNextConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_EMAIL): cv.string,
-                    vol.Required(CONF_PASSWORD): cv.string,
+                    vol.Required(CONF_REFRESH_TOKEN): cv.string,
                 }
             ),
             errors=errors,
@@ -128,35 +126,28 @@ class EonNextConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         reauth_entry = self._get_reauth_entry()
-        existing_email = reauth_entry.data[CONF_EMAIL]
 
         if user_input is not None:
-            email = user_input[CONF_EMAIL].strip().lower()
-            password = user_input[CONF_PASSWORD]
-
-            # Reauth must stay on the same account: if the user submits a
-            # different email, abort instead of silently rebinding the entry to
-            # another account (which would leave unique_id pointing at A while
-            # its data belongs to B - duplicate entries and colliding
-            # meter-serial unique_ids follow).
-            await self.async_set_unique_id(email)
-            self._abort_if_unique_id_mismatch(reason="reauth_account_mismatch")
-
             try:
-                refresh_token = await self._validate_credentials(email, password)
+                refresh_token = await self._validate_refresh_token(
+                    user_input[CONF_REFRESH_TOKEN]
+                )
             except EonNextApiError:
                 errors["base"] = "cannot_connect"
             except Exception:  # pylint: disable=broad-except
                 errors["base"] = "unknown"
             else:
                 if refresh_token is not None:
+                    # Drop the legacy password: Kraken no longer accepts it.
+                    data = {
+                        k: v
+                        for k, v in reauth_entry.data.items()
+                        if k != CONF_PASSWORD
+                    }
+                    data[CONF_REFRESH_TOKEN] = refresh_token
                     return self.async_update_reload_and_abort(
                         reauth_entry,
-                        data_updates={
-                            CONF_EMAIL: email,
-                            CONF_PASSWORD: password,
-                            CONF_REFRESH_TOKEN: refresh_token,
-                        },
+                        data=data,
                         reason="reauth_successful",
                     )
                 errors["base"] = "invalid_auth"
@@ -165,10 +156,10 @@ class EonNextConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="reauth_confirm",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_EMAIL, default=existing_email): cv.string,
-                    vol.Required(CONF_PASSWORD): cv.string,
+                    vol.Required(CONF_REFRESH_TOKEN): cv.string,
                 }
             ),
+            description_placeholders={"email": reauth_entry.data[CONF_EMAIL]},
             errors=errors,
         )
 
